@@ -1,0 +1,341 @@
+//=======================================================================================================
+//
+// SharpMZ2500.sv - MiSTer top level for the Sharp MZ-2500 / MZ-2520 core (BOOTSTRAP).
+//
+// OSD, clocks, hps_io and video output. The machine itself is rtl/mz2500.sv (for now a test pattern and a
+// T80 running a stub program). sys/ is the stock Template_MiSTer sys drop-in.
+//
+// Copyright (C) 2026 Alan Steremberg. Based on Template_MiSTer (C) Sorgelig.
+//
+// This source file is free software: you can redistribute it and/or modify it under the terms of the GNU
+// General Public License as published by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This source file is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even
+// the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public
+// License for more details. You should have received a copy of the GNU General Public License along with
+// this program. If not, see <http://www.gnu.org/licenses/>.
+//=======================================================================================================
+
+module emu
+(
+	`include "sys/emu_ports.vh"
+);
+
+///////// Default values for ports not used in this core /////////
+
+assign ADC_BUS  = 'Z;
+assign USER_OUT = '1;
+assign {UART_RTS, UART_DTR} = 0;
+assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
+// SDRAM: main RAM, kanji and dictionary ROMs will live here (docs/design.md). Unused for now.
+assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = '0;
+
+`ifdef MISTER_DUAL_SDRAM
+assign {SDRAM2_DQ, SDRAM2_A, SDRAM2_BA, SDRAM2_CLK, SDRAM2_nWE, SDRAM2_nCAS, SDRAM2_nRAS, SDRAM2_nCS} = 'Z;
+`endif
+
+`ifdef MISTER_FB
+assign FB_EN = 0;
+assign FB_FORMAT = 0;
+assign FB_WIDTH = 0;
+assign FB_HEIGHT = 0;
+assign FB_BASE = 0;
+assign FB_STRIDE = 0;
+assign FB_FORCE_BLANK = 0;
+`ifdef MISTER_FB_PALETTE
+assign FB_PAL_CLK = 0;
+assign FB_PAL_ADDR = 0;
+assign FB_PAL_DOUT = 0;
+assign FB_PAL_WR = 0;
+`endif
+`endif
+
+assign VGA_F1 = 0;
+assign VGA_SCALER = 0;
+assign VGA_DISABLE = 0;
+assign HDMI_FREEZE = 0;
+assign HDMI_BLACKOUT = 0;
+assign HDMI_BOB_DEINT = 0;
+
+assign LED_POWER = 0;
+assign BUTTONS = 0;
+
+//////////////////////////////////////////////////////////////////
+
+`include "build_id.v"
+
+// Placeholder menu. Planned entries (docs/design.md): boot.rom / IPL, CG, kanji and dictionary ROM loading,
+// Planned: drives 3-4, tape image, boot mode switch, model (2500/2520), mouse, joystick.
+localparam CONF_STR =
+{
+	"SharpMZ2500;;",
+	"-;",
+	"-,Needs games/SharpMZ2500/boot.rom (IPL + kanji);",
+	"-;",
+	"S0,D88,Drive 1;",
+	"S1,D88,Drive 2;",
+`ifdef MZ_FOUR_DRIVES
+	"S2,D88,Drive 3;",
+	"S3,D88,Drive 4;",
+`endif
+	"-;",
+	"F1,MZT,Load tape;",
+	"F2,BINDAT,Load RAM image (MZ-2000);",
+	"-;",
+	"O[1],Lines (reset),400 (24 kHz),200 (15 kHz);",
+	"O[3:2],Boot mode (reset),MZ-2500,MZ-2000,MZ-80B;",
+	"O[7],Keyboard,Japanese (positional),US (symbols);",
+	"O[8],Model (reset),MZ-2500,MZ-2520;",
+	"-;",
+	"O[6:5],Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%;",
+	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+	"-;",
+	"T[0],Reset;",
+	"R[0],Reset and close OSD;",
+	"J1,Trigger A,Trigger B;",
+	"V,v",`BUILD_DATE
+};
+
+/////////////////  CLOCKS  ////////////////////////
+
+// 85.909091 MHz = 24 x 3.579545 MHz (4 x the 21.477 MHz 400-line dot clock, 6 x the 14.318 MHz 200-line one).
+// The CPU (6 MHz), OPN (2 MHz) and 8253 clocks come from accumulators in rtl/mz2500.sv.
+wire clk_sys;
+wire clk_sdram;                  // clk_sys phase shifted: drives the SDRAM_CLK pin (see rtl/sdram.sv)
+wire pll_locked;
+
+pll pll
+(
+	.refclk(CLK_50M),
+	.rst(0),
+	.outclk_0(clk_sys),
+	.outclk_1(clk_sdram),
+	.locked(pll_locked)
+);
+
+/////////////////  HPS  ///////////////////////////
+
+wire forced_scandoubler;
+wire [21:0] gamma_bus;
+wire  [1:0] buttons;
+wire [127:0] status;
+wire [10:0] ps2_key;
+wire [31:0] joystick_0, joystick_1;
+wire [64:0] rtc;
+wire [24:0] ps2_mouse;
+
+wire        ioctl_download;
+wire [15:0] ioctl_index;
+wire        ioctl_wr;
+wire [26:0] ioctl_addr;
+wire  [7:0] ioctl_dout;
+wire        ioctl_wait;
+
+// Floppy image slots S0/S1 (drives 1 and 2), 512-byte blocks
+wire  [3:0] img_mounted;
+wire        img_readonly;
+wire [63:0] img_size;
+wire [31:0] sd_lba[4];
+wire  [3:0] sd_rd, sd_wr, sd_ack;
+wire  [8:0] sd_buff_addr;
+wire  [7:0] sd_buff_dout;
+wire  [7:0] sd_buff_din[4];
+wire        sd_buff_wr;
+wire        fdd_busy;
+assign LED_DISK = {1'b0, fdd_busy};
+
+// Floppy slots: 2, or 4 with the MZ_FOUR_DRIVES macro (rtl/mz2500_fdc.sv); the machine's buses are 4 wide
+`ifdef MZ_FOUR_DRIVES
+localparam NDRV = 4;
+`else
+localparam NDRV = 2;
+`endif
+wire [NDRV-1:0] h_mounted, h_rd, h_wr, h_ack;
+wire     [31:0] h_lba[NDRV];
+wire      [7:0] h_buff_din[NDRV];
+wire      [5:0] h_blk_cnt[NDRV];
+assign img_mounted = 4'(h_mounted);
+assign sd_ack      = 4'(h_ack);
+assign h_rd        = sd_rd[NDRV-1:0];
+assign h_wr        = sd_wr[NDRV-1:0];
+genvar hd;
+generate
+	for (hd = 0; hd < NDRV; hd = hd + 1) begin : hslot
+		assign h_lba[hd]      = sd_lba[hd];
+		assign h_buff_din[hd] = sd_buff_din[hd];
+		assign h_blk_cnt[hd]  = 6'd0;
+	end
+endgenerate
+
+hps_io #(.CONF_STR(CONF_STR), .VDNUM(NDRV)) hps_io
+(
+	.clk_sys(clk_sys),
+	.HPS_BUS(HPS_BUS),
+	.EXT_BUS(),
+	.gamma_bus(gamma_bus),
+
+	.buttons(buttons),
+	.status(status),
+	.status_menumask(16'd0),
+	.forced_scandoubler(forced_scandoubler),
+
+	.ps2_key(ps2_key),
+	.joystick_0(joystick_0),
+	.joystick_1(joystick_1),
+	.RTC(rtc),
+	.ps2_mouse(ps2_mouse),
+
+	.ioctl_download(ioctl_download),
+	.ioctl_index(ioctl_index),
+	.ioctl_wr(ioctl_wr),
+	.ioctl_addr(ioctl_addr),
+	.ioctl_dout(ioctl_dout),
+	.ioctl_wait(ioctl_wait),
+
+	.img_mounted(h_mounted),
+	.img_readonly(img_readonly),
+	.img_size(img_size),
+	.sd_lba(h_lba),
+	.sd_blk_cnt(h_blk_cnt),
+	.sd_rd(h_rd),
+	.sd_wr(h_wr),
+	.sd_ack(h_ack),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_din(h_buff_din),
+	.sd_buff_wr(sd_buff_wr)
+);
+
+/////////////////  RESET  /////////////////////////
+
+wire reset = RESET | status[0] | buttons[1] | ~pll_locked;
+
+/////////////////  MACHINE  ///////////////////////
+
+// the 200/400-line switch takes effect at reset, like Boot mode and Model: software reads it when it starts and
+// programs the CRTC once, so a change mid-game left the old timing values on the new raster (Druaga lost its bottom
+// 20 lines at 200). During reset the new setting passes through, so the video registers reset to its values.
+reg         lines400_l = 1'b1;
+always @(posedge clk_sys) if (reset) lines400_l <= ~status[1];
+wire        lines400 = reset ? ~status[1] : lines400_l;
+wire        ce_pix;
+wire  [7:0] R, G, B;
+wire        HSync, VSync, HBlank, VBlank;
+wire [15:0] audio_l, audio_r;
+
+// SDRAM: main RAM 256 KB and the IPL ROM (rtl/mz2500.sv has the map), 8-bit accesses
+wire        dram_rd, dram_we, dram_ready;
+wire [24:0] dram_addr;
+wire  [7:0] dram_din;
+wire [15:0] dram_dout;
+
+sdram sdram
+(
+	.init(~pll_locked),
+	.clk(clk_sys),
+	.clk_pin(clk_sdram),
+	.SDRAM_DQ(SDRAM_DQ), .SDRAM_A(SDRAM_A), .SDRAM_DQML(SDRAM_DQML), .SDRAM_DQMH(SDRAM_DQMH), .SDRAM_BA(SDRAM_BA),
+	.SDRAM_nCS(SDRAM_nCS), .SDRAM_nWE(SDRAM_nWE), .SDRAM_nRAS(SDRAM_nRAS), .SDRAM_nCAS(SDRAM_nCAS),
+	.SDRAM_CKE(SDRAM_CKE), .SDRAM_CLK(SDRAM_CLK),
+	.wtbt(2'b00),
+	.addr(dram_addr),
+	.dout(dram_dout),
+	.din({8'h00, dram_din}),
+	.we(dram_we),
+	.rd(dram_rd),
+	.ready(dram_ready)
+);
+
+// Debug channel: a snapshot of the machine every 0.1 s on UART TX (/dev/ttyS1 on the HPS, 115200 baud)
+wire [63:0] mz_dbg;
+dbg_uart dbg_uart (.clk(clk_sys), .value(mz_dbg), .tx(UART_TXD));
+
+mz2500 mz2500
+(
+	.clk_sys(clk_sys),
+	.dbg(mz_dbg),
+	.kbd_us(status[7]),
+	.model_2520(status[8]),
+	.reset(reset),
+	.lines400(lines400),
+	.boot_mode(status[3:2] == 2'd3 ? 2'd0 : status[3:2]),
+	.ps2_key(ps2_key),
+	.rtc(rtc),
+	.joy0(joystick_0[5:0]),
+	.joy1(joystick_1[5:0]),
+	.ps2_mouse(ps2_mouse),
+
+	.ioctl_download(ioctl_download),
+	.ioctl_index(ioctl_index[7:0]),
+	.ioctl_wr(ioctl_wr),
+	.ioctl_addr(ioctl_addr[24:0]),
+	.ioctl_dout(ioctl_dout),
+	.ioctl_wait(ioctl_wait),
+
+	.img_mounted(img_mounted), .img_readonly(img_readonly), .img_size(img_size),
+	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack),
+	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout), .sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr),
+	.fdd_busy(fdd_busy),
+
+	.ram_rd(dram_rd), .ram_we(dram_we), .ram_addr(dram_addr), .ram_din(dram_din), .ram_dout(dram_dout[7:0]), .ram_ready(dram_ready),
+
+	.ce_pix(ce_pix),
+	.R(R), .G(G), .B(B),
+	.HSync(HSync), .VSync(VSync),
+	.HBlank(HBlank), .VBlank(VBlank),
+
+	.audio_l(audio_l),
+	.audio_r(audio_r),
+
+	.cpu_pc(),
+	.cpu_ce(),
+	.cpu_m1_n(),
+	.dbg_io_wr(),
+	.dbg_io_port(),
+	.dbg_io_data()
+);
+
+/////////////////  AUDIO  /////////////////////////
+
+assign AUDIO_L = audio_l;
+assign AUDIO_R = audio_r;
+assign AUDIO_S = 1'b1;
+assign AUDIO_MIX = 2'd0;
+
+/////////////////  VIDEO  /////////////////////////
+
+assign LED_USER  = ioctl_download;
+assign CLK_VIDEO = clk_sys;
+
+// 400-line mode is already 24.86 kHz: no scandoubler there (HDMI goes through the scaler; analogue output
+// needs vga_scaler=1 or a 24 kHz monitor). 200-line mode is 15.98 kHz and may be doubled.
+wire [1:0] scale = status[6:5];
+wire [2:0] sl    = scale ? scale - 1'd1 : 3'd0;
+wire       sd_on = ~lines400 & (scale != 2'd0 || forced_scandoubler);
+assign VGA_SL = sd_on ? sl[1:0] : 2'd0;
+
+video_mixer #(.LINE_LENGTH(1024), .HALF_DEPTH(0), .GAMMA(1)) video_mixer
+(
+	.CLK_VIDEO(CLK_VIDEO),
+	.CE_PIXEL(CE_PIXEL),
+	.ce_pix(ce_pix),
+	.scandoubler(sd_on),
+	.hq2x(scale == 2'd1),
+	.gamma_bus(gamma_bus),
+	.R(R), .G(G), .B(B),
+	.HSync(HSync), .VSync(VSync),
+	.HBlank(HBlank), .VBlank(VBlank),
+	.HDMI_FREEZE(1'b0),
+	.freeze_sync(),
+	.VGA_R(VGA_R), .VGA_G(VGA_G), .VGA_B(VGA_B),
+	.VGA_VS(VGA_VS), .VGA_HS(VGA_HS),
+	.VGA_DE(VGA_DE)
+);
+
+wire [1:0] ar = status[122:121];
+
+assign VIDEO_ARX = (!ar) ? 12'd4 : (ar - 1'd1);
+assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
+
+endmodule
