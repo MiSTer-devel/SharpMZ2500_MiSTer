@@ -121,7 +121,7 @@ assignments from `sys/*.tcl` into the `.qsf` during a build; don't commit that (
 `.qsf`, `.sdc`, `.srf` and `sys/` are Template_MiSTer master as of commit e901a9f (2026-11-03), byte for byte: update
 them from the template rather than editing them.
 
-Release build 20261103: 20,334 ALMs (49 %), 2.35 Mbit block RAM (42 %), timing met with the default seed (clk_sys
+Release build 20261104: 20,334 ALMs (49 %), 2.35 Mbit block RAM (42 %), timing met with the default seed (clk_sys
 85.90909 MHz).
 
 ## Licence

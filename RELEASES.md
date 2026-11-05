@@ -3,7 +3,7 @@
 Copy the newest `releases/SharpMZ2500_<date>.rbf` to `/media/fat/_Computer/` on the MiSTer SD card (setup, ROMs and
 disks: [README](README.md#getting-started)). Newest first.
 
-## 20261103 (first release)
+## 20261104 (first release)
 
 - MZ-2500 and MZ-2520 models; 400- and 200-line modes (OSD **Lines**, applied at reset); MZ-2500, MZ-2000 and MZ-80B
   boot modes.
